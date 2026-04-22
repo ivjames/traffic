@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Freeway Traffic Simulator</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app">
+    <section class="panel controls">
+      <h1>Freeway Traffic Simulator</h1>
+      <p class="subtitle">Tune driver behavior and see emergent traffic patterns at freeway scale.</p>
+
+      <div class="scenario-box">
+        <label for="scenario">Auto scenario</label>
+        <select id="scenario"></select>
+        <button id="runScenario">Run Scenario</button>
+      </div>
+
+      <div class="controls-grid" id="controls"></div>
+
+      <div class="buttons">
+        <button id="toggleRun">Pause</button>
+        <button id="reset">Reset</button>
+      </div>
+    </section>
+
+    <section class="panel sim">
+      <canvas id="simCanvas" width="1280" height="540"></canvas>
+      <div class="stats" id="stats"></div>
+      <p id="scenarioStatus" class="scenario-status"></p>
+      <p class="hint">
+        Tip: click “Run Scenario” to see timed traffic changes without touching sliders.
+      </p>
+    </section>
+  </main>
+
+  <script src="sim.js" type="module"></script>
+</body>
+</html>
