@@ -4,13 +4,20 @@ const statsEl = document.getElementById("stats");
 const controlsEl = document.getElementById("controls");
 
 const LANES = 5;
-const ROAD_LENGTH = 3200;
+const ROAD_LENGTH = 19600;
 const BASE_LANE_HEIGHT = canvas.height / (LANES + 1);
-const DT = 0.16;
-const MAX_CARS = 520;
+const LANE_HEIGHT_SCALE = 0.7;
+const LANE_HEIGHT = BASE_LANE_HEIGHT * LANE_HEIGHT_SCALE;
+const DT = 0.12;
+const MAX_CARS = 90;
+const LANE_VISUAL_BLEND_RATE = 0.12;
+const CAR_VISUAL_LENGTH_PX = 20;
+const TRUCK_VISUAL_LENGTH_PX = 45;
+const ROAD_UNITS_PER_PIXEL = ROAD_LENGTH / canvas.width;
+const TRUCK_MIN_LANE = LANES - 2;
 
 const settings = {
-  inflow: 0.56,
+  inflow: 0.18,
   desiredSpeed: 33,
   aggressiveness: 0.55,
   reactionTime: 1.1,
@@ -37,6 +44,18 @@ let simTime = 0;
 let nextId = 1;
 
 const fmt = (v, n = 2) => Number(v).toFixed(n);
+
+function getRoadTop() {
+  return (canvas.height - LANES * LANE_HEIGHT) * 0.5;
+}
+
+function laneBoundaryY(index) {
+  return getRoadTop() + index * LANE_HEIGHT;
+}
+
+function laneCenterY(lane) {
+  return getRoadTop() + (lane + 0.5) * LANE_HEIGHT;
+}
 
 function buildControls() {
   controlDefs.forEach(([key, label, [min, max, step], units]) => {
@@ -67,20 +86,28 @@ function buildControls() {
   });
 }
 
-function spawnCar(lane) {
+function spawnCar(lane, truckOverride = null) {
   if (cars.length >= MAX_CARS) return;
-  const truck = Math.random() < settings.truckFraction;
+  const requestedTruck = truckOverride === null ? Math.random() < settings.truckFraction : truckOverride;
+  const truck = requestedTruck && lane >= TRUCK_MIN_LANE;
+  const visualLengthPx = truck ? TRUCK_VISUAL_LENGTH_PX : CAR_VISUAL_LENGTH_PX;
+  const desiredSpeedFactor = truck ? 0.55 + Math.random() * 0.38 : 0.72 + Math.random() * 0.62;
+  const initialSpeed = truck ? 16 + Math.random() * 10 : 18 + Math.random() * 18;
   cars.push({
     id: nextId++,
     x: 0,
     lane,
-    v: truck ? 22 + Math.random() * 3 : 24 + Math.random() * 9,
+    laneVisual: lane,
+    v: initialSpeed,
     a: 0,
-    length: truck ? 16 : 7,
+    // Collision length matches marker length to avoid visual overlap.
+    length: visualLengthPx * ROAD_UNITS_PER_PIXEL,
+    visualLengthPx,
     truck,
-    aggressiveness: Math.min(1, Math.max(0.02, settings.aggressiveness + (Math.random() - 0.5) * 0.18)),
-    desiredSpeed: settings.desiredSpeed * (truck ? 0.68 : 1) * (0.9 + Math.random() * 0.24),
-    reactionTime: settings.reactionTime * (0.82 + Math.random() * 0.35),
+    preferredGap: visualLengthPx * ROAD_UNITS_PER_PIXEL * (1 + Math.random() * 2),
+    aggressiveness: Math.min(1, Math.max(0.02, settings.aggressiveness + (Math.random() - 0.5) * 0.3)),
+    desiredSpeed: settings.desiredSpeed * desiredSpeedFactor,
+    reactionTime: settings.reactionTime * (0.7 + Math.random() * 0.7),
     laneBias: (Math.random() - 0.5) * (1 - settings.laneDiscipline),
   });
 }
@@ -89,10 +116,11 @@ function seedTraffic() {
   cars = [];
   nextId = 1;
   for (let lane = 0; lane < LANES; lane++) {
-    const count = 35;
+    const count = 7;
     for (let i = 0; i < count; i++) {
       spawnCar(lane);
       cars[cars.length - 1].x = (i / count) * ROAD_LENGTH + Math.random() * 8;
+      cars[cars.length - 1].laneVisual = lane;
     }
   }
 }
@@ -101,15 +129,69 @@ function getLaneCars(lane) {
   return cars.filter((c) => c.lane === lane).sort((a, b) => a.x - b.x);
 }
 
+function forwardDistance(xFrom, xTo) {
+  return xTo >= xFrom ? xTo - xFrom : ROAD_LENGTH - xFrom + xTo;
+}
+
+function centerGap(rearX, rearLength, frontX, frontLength) {
+  return forwardDistance(rearX, frontX) - (rearLength + frontLength) * 0.5;
+}
+
+function gapsAroundPosition(laneCars, x, length) {
+  if (laneCars.length === 0) {
+    return { gapAhead: Infinity, gapBehind: Infinity };
+  }
+
+  const front = laneCars.find((c) => c.x > x) ?? null;
+  let rear = null;
+  for (let i = laneCars.length - 1; i >= 0; i--) {
+    if (laneCars[i].x < x) {
+      rear = laneCars[i];
+      break;
+    }
+  }
+
+  return {
+    gapAhead: front ? centerGap(x, length, front.x, front.length) : Infinity,
+    gapBehind: rear ? centerGap(rear.x, rear.length, x, length) : Infinity,
+  };
+}
+
+function leadInOpenLane(laneCars, x) {
+  return laneCars.find((c) => c.x > x) ?? null;
+}
+
+function canSpawnAtStart(lane, length) {
+  const laneCars = getLaneCars(lane);
+  if (laneCars.length === 0) return true;
+
+  const lead = leadInOpenLane(laneCars, 0);
+  if (!lead) return true;
+
+  const gap = centerGap(0, length, lead.x, lead.length);
+  return gap > 8;
+}
+
 function gapAhead(car, laneCars) {
+  if (laneCars.length === 0) {
+    return { lead: car, gap: ROAD_LENGTH };
+  }
+
   const idx = laneCars.findIndex((c) => c.id === car.id);
-  const lead = laneCars[(idx + 1) % laneCars.length];
-  const dx = lead.x > car.x ? lead.x - car.x : ROAD_LENGTH - car.x + lead.x;
-  return { lead, gap: dx - lead.length };
+  if (idx === -1) {
+    // During lane-change evaluation, the car may be assessed in a lane it is not yet part of.
+    const lead = leadInOpenLane(laneCars, car.x);
+    if (!lead) return { lead: car, gap: ROAD_LENGTH };
+    return { lead, gap: centerGap(car.x, car.length, lead.x, lead.length) };
+  }
+
+  const lead = laneCars[idx + 1];
+  if (!lead) return { lead: car, gap: ROAD_LENGTH };
+  return { lead, gap: centerGap(car.x, car.length, lead.x, lead.length) };
 }
 
 function desiredGap(car, dv) {
-  const minGap = car.truck ? 4.8 : 2.2;
+  const minGap = car.preferredGap ?? car.length;
   return minGap + Math.max(0, car.v * car.reactionTime + (car.v * dv) / (2.2 * Math.sqrt(1.4 * 2.4)));
 }
 
@@ -128,12 +210,24 @@ function computeAcceleration(car, laneCars) {
 
 function laneChangeScore(car, targetLane, laneMap) {
   if (targetLane < 0 || targetLane >= LANES) return -Infinity;
+  if (car.truck && targetLane < TRUCK_MIN_LANE) return -Infinity;
   const currentCars = laneMap.get(car.lane);
   const targetCars = laneMap.get(targetLane);
+
+  const { gapAhead, gapBehind } = gapsAroundPosition(targetCars, car.x, car.length);
+  const minMergeGap = 1.5 + car.v * 0.25;
+  if (gapAhead < minMergeGap || gapBehind < minMergeGap) return -Infinity;
+
   const aCurrent = computeAcceleration(car, currentCars);
   const aTarget = computeAcceleration(car, targetCars);
 
-  const idxBehind = targetCars.findLastIndex((c) => c.x < car.x);
+  let idxBehind = -1;
+  for (let i = targetCars.length - 1; i >= 0; i--) {
+    if (targetCars[i].x < car.x) {
+      idxBehind = i;
+      break;
+    }
+  }
   const follower = idxBehind >= 0 ? targetCars[idxBehind] : targetCars[targetCars.length - 1];
   if (!follower) return aTarget - aCurrent;
 
@@ -149,9 +243,22 @@ function laneChangeScore(car, targetLane, laneMap) {
 function maybeSpawnVehicles() {
   for (let lane = 0; lane < LANES; lane++) {
     if (Math.random() < settings.inflow * DT) {
-      const laneCars = getLaneCars(lane);
-      const hasRoom = laneCars.every((c) => !(c.x < 45 || c.x > ROAD_LENGTH - 45));
-      if (hasRoom) spawnCar(lane);
+      const truck = Math.random() < settings.truckFraction && lane >= TRUCK_MIN_LANE;
+      const length = (truck ? TRUCK_VISUAL_LENGTH_PX : CAR_VISUAL_LENGTH_PX) * ROAD_UNITS_PER_PIXEL;
+      if (canSpawnAtStart(lane, length)) spawnCar(lane, truck);
+    }
+  }
+}
+
+function enforceLaneSeparation(laneCars) {
+  const minGap = 0.5;
+  for (let i = 0; i < laneCars.length - 1; i++) {
+    const rear = laneCars[i];
+    const front = laneCars[i + 1];
+    const maxRearX = front.x - (rear.length + front.length) * 0.5 - minGap;
+    if (rear.x > maxRearX) {
+      rear.x = maxRearX;
+      rear.v = Math.min(rear.v, front.v);
     }
   }
 }
@@ -166,10 +273,17 @@ function update() {
   }
 
   for (const car of cars) {
-    if (Math.random() < 0.22) {
+    const laneCars = laneMap.get(car.lane);
+    const aCurrent = computeAcceleration(car, laneCars);
+    const speedDeficit = Math.max(0, (car.desiredSpeed - car.v) / Math.max(1, car.desiredSpeed));
+    const accelDeficit = Math.max(0, 0.9 - aCurrent);
+    const mergePressure = Math.min(1, speedDeficit * 0.9 + accelDeficit * 0.45);
+    const evaluateChance = Math.min(0.88, 0.2 + mergePressure * 0.65);
+
+    if (Math.random() < evaluateChance) {
       const left = laneChangeScore(car, car.lane - 1, laneMap);
       const right = laneChangeScore(car, car.lane + 1, laneMap);
-      const threshold = 0.2 + (1 - car.aggressiveness) * 0.65;
+      const threshold = Math.max(0.04, 0.24 + (1 - car.aggressiveness) * 0.6 - mergePressure * 0.32);
       if (left > right && left > threshold) car.lane -= 1;
       else if (right > threshold) car.lane += 1;
     }
@@ -177,11 +291,44 @@ function update() {
 
   for (let lane = 0; lane < LANES; lane++) laneMap.set(lane, getLaneCars(lane));
 
+  const proposedAdvance = new Map();
   cars.forEach((car) => {
     const laneCars = laneMap.get(car.lane);
     car.a = computeAcceleration(car, laneCars);
     car.v = Math.max(0, Math.min(48, car.v + car.a * DT));
-    car.x = (car.x + car.v * DT + ROAD_LENGTH) % ROAD_LENGTH;
+    proposedAdvance.set(car.id, car.v * DT);
+  });
+
+  for (let lane = 0; lane < LANES; lane++) {
+    const laneCars = getLaneCars(lane);
+    if (laneCars.length <= 1) {
+      laneCars.forEach((car) => {
+        const dx = proposedAdvance.get(car.id) ?? 0;
+        car.x += dx;
+      });
+      continue;
+    }
+
+    laneCars.forEach((car, index) => {
+      const lead = laneCars[index + 1] ?? null;
+      const maxDx = lead ? Math.max(0, centerGap(car.x, car.length, lead.x, lead.length)) : Infinity;
+      const desiredDx = proposedAdvance.get(car.id) ?? 0;
+      const dx = Math.min(desiredDx, maxDx);
+      car.v = dx / DT;
+      car.x += dx;
+    });
+
+    enforceLaneSeparation(laneCars);
+  }
+
+  // Remove vehicles that have fully left the visible road segment.
+  cars = cars.filter((car) => car.x - car.length * 0.5 <= ROAD_LENGTH + 2);
+
+  // Smooth lane transitions for rendering so merges are continuous.
+  const laneBlend = Math.min(1, DT * LANE_VISUAL_BLEND_RATE);
+  cars.forEach((car) => {
+    if (typeof car.laneVisual !== "number") car.laneVisual = car.lane;
+    car.laneVisual += (car.lane - car.laneVisual) * laneBlend;
   });
 }
 
@@ -189,14 +336,14 @@ function drawRoad() {
   ctx.fillStyle = "#0b1220";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const roadTop = BASE_LANE_HEIGHT * 0.65;
-  const roadBottom = BASE_LANE_HEIGHT * (LANES + 0.35);
+  const roadTop = laneBoundaryY(0);
+  const roadBottom = laneBoundaryY(LANES);
 
   ctx.fillStyle = "#111827";
   ctx.fillRect(0, roadTop, canvas.width, roadBottom - roadTop);
 
   for (let i = 0; i <= LANES; i++) {
-    const y = BASE_LANE_HEIGHT * (i + 0.5);
+    const y = laneBoundaryY(i);
     ctx.strokeStyle = i === 0 || i === LANES ? "#e5e7eb88" : "#94a3b866";
     ctx.setLineDash(i === 0 || i === LANES ? [] : [16, 15]);
     ctx.beginPath();
@@ -214,14 +361,20 @@ function drawRoad() {
 
 function drawCars() {
   cars.forEach((car) => {
-    const px = (car.x / ROAD_LENGTH) * canvas.width;
-    const laneY = BASE_LANE_HEIGHT * (car.lane + 1);
-    const py = laneY - 11;
-    const w = (car.length / ROAD_LENGTH) * canvas.width * 5.1;
+    if (car.x + car.length * 0.5 < 0 || car.x - car.length * 0.5 > ROAD_LENGTH) return;
 
-    const speedRatio = car.v / Math.max(12, car.desiredSpeed);
-    const hue = Math.max(0, Math.min(130, speedRatio * 130));
-    ctx.fillStyle = car.truck ? `hsl(${hue * 0.4}, 85%, 60%)` : `hsl(${hue}, 80%, 56%)`;
+    const px = (car.x / ROAD_LENGTH) * canvas.width;
+    const laneY = laneCenterY(car.laneVisual);
+    const py = laneY - 11;
+    const w = car.visualLengthPx ?? (car.truck ? TRUCK_VISUAL_LENGTH_PX : CAR_VISUAL_LENGTH_PX);
+
+    const speedRatio = Math.max(0, Math.min(1.25, car.v / Math.max(12, car.desiredSpeed)));
+    const colorProgress = Math.pow(Math.min(1, speedRatio), 0.6);
+    const hue = 8 + colorProgress * 132;
+    const lightness = 45 + colorProgress * 20;
+    ctx.fillStyle = car.truck
+      ? `hsl(${hue * 0.5}, 90%, ${Math.min(70, lightness + 4)}%)`
+      : `hsl(${hue}, 92%, ${lightness}%)`;
     ctx.fillRect(px - w * 0.5, py, w, 21);
   });
 }
@@ -252,7 +405,7 @@ function updateStats() {
 
 function frame() {
   if (running) {
-    for (let i = 0; i < 2; i++) update();
+    update();
   }
   drawRoad();
   drawCars();
